@@ -114,7 +114,7 @@ let monitoringProcess = null;
 function ensureMonitoringProcess() {
   if (!monitoringProcess) {
     // monitoring.js should be the second file in this project
-    monitoringProcess = fork(path.join(__dirname, "iceberghelpergit.js"));
+    monitoringProcess = fork(path.join(__dirname, "monitor.js"));
 
     monitoringProcess.on("message", (msg) => {
       // Optionally handle messages from the child here if needed
