@@ -257,7 +257,3 @@ From the **Manage Positions** menu, you can:
 This project is **MIT Licensed** – Free to use, modify, and distribute.  
 
 ---
-
-## 📬 Support & Contributions
-💡 **Found a bug or have an idea?** Open an issue or PR on **GitHub**.  
-🔗 **Join the discussion**: [GitHub Issues](https://github.com/YOUR_GITHUB_USERNAME/iceberg-bot/issues)  
