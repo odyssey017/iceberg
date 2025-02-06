@@ -1,18 +1,18 @@
-# 🧊 Iceberg Trading Bot
+# 🧊 Iceberg Betting Bot
 
 ## 📌 Overview
-The **Iceberg Trading Bot** is an automated betting bot tool for **SX Bet**.  
-It allows users to **place, monitor, and adjust trading positions** dynamically while controlling order flow.  
-The bot ensures **liquidity management**, **risk mitigation**, and **vig monitoring** to maintain competitive market positions.
+The **Iceberg Trading Bot** is an automated betting tool for **SX Bet**.  
+
+The bot allows users to programmatically create and manage orders at a specificed edge above the current top available odds on the orderbook using an "iceberg" strategy, where large bets are split into smaller increments. It continuously monitors the order book, adjusting or canceling orders based on market conditions, vig thresholds, and order fills to ensure efficient execution without an odds feed. The bot runs through an interactive CLI, allowing users to create, manage, and monitor trading positions in real time.
 
 ---
 
 ## ✨ Features
-✅ **Automated Order Updates** – Monitors the orderbook and dynamically updates your orders to always be at optimal odds.
+✅ **Automated Order Updates** – Monitors the orderbook and dynamically updates your orders to always be at optimal odds.  
 ✅ **Vig Monitoring** – Cancels orders when market vig exceeds your set limit.  
-✅ **Iceberg Orders** – Splits large orders into smaller increments. The increment is the max risk on the orderbook at one time.
+✅ **Iceberg Orders** – Splits large orders into smaller increments. The increment is the max risk on the orderbook at one time.  
 ✅ **CLI Interface** – User-friendly interactive command-line menu.  
-✅ **Manage Positions/Orders** – View, update, or cancel a position and it's associated orders at any time.
+✅ **Manage Positions/Orders** – View, update, or cancel a position and it's associated orders at any time.  
 ✅ **Logging** – Detailed logs to monitor execution and performance.  
 
 ---
@@ -71,16 +71,16 @@ When placing orders, the bot follows a **systematic approach** based on the user
 ### **Example Scenario:**
 - **Best Taker Odds:**
   ```
-  Outcome 1: 0.58
-  Outcome 2: 0.45
+  Outcome 1: 0.60
+  Outcome 2: 0.50
   ```
 - Vig Calculation:  
   ```
-  0.58 + 0.45 - 1 = 0.03 (3% vig)
+  0.60 + 0.50 - 1 = 0.1 (10% vig)
   ```
-- Your **MaxVig = 2% (0.02)**  
+- Your **MaxVig = 7% (0.07)**  
 
-🚨 **Since the actual Vig (3%) exceeds the allowed MaxVig (2%), the bot cancels active orders and does NOT place new ones.**  
+🚨 **Since the actual Vig (10%) exceeds the allowed MaxVig (7%), the bot cancels active orders and does NOT place new ones.**  
 
 ---
 
@@ -216,7 +216,7 @@ From the **Manage Positions** menu, you can:
 - **Edit** a position -> change the **max fill, increments to post, edge, max vig, minimum order size to consider**  
 - **Cancel** a position -> cancels active orders on the specified market, and stops monitoring
 
-### ***3️⃣ Exit (Kill Switch)**
+### **3️⃣ Exit (Kill Switch)**
 - From the main menu, selecting the option to exit will kill all your existing orders, and stop monitoring for updates.
 
 ---
@@ -224,15 +224,18 @@ From the **Manage Positions** menu, you can:
 ## 📂 File Structure
 
 ```
-📁 iceberg
-├── 📜 README.md          # This documentation
-├── 📜 .gitignore         # Ignore sensitive files
+📁 iceberg-bot
+├── 📜 README.md          # Documentation & setup guide
+├── 📜 .gitignore         # Ignore sensitive files & unnecessary directories
 ├── 📜 LICENSE            # License file
-├── 📜 config.js          # Configuration file
-├── 📜 iceberg.js         # CLI and position management
-├── 📜 network.js         # Handles API requests
-├── 📜 logger.js          # Logging utilities
-└── 📜 monitor.js         # Monitoring & execution
+├── 📜 config.js          # Configuration settings (API URLs, default parameters)
+├── 📜 iceberg.js         # Main CLI for managing positions & interacting with the bot
+├── 📜 network.js         # Handles API requests (order placement, cancellations, market data)
+├── 📜 logger.js          # Centralized logging utility (used in monitor.js)
+├── 📜 monitor.js         # Market monitoring, order validation, and execution logic
+├── 📜 package.json       # Node.js project metadata & dependencies
+├── 📜 package-lock.json  # Ensures consistent dependency installation
+└── 📂 node_modules/      # Installed dependencies (not included in Git)
 ```
 
 ---
@@ -241,8 +244,8 @@ From the **Manage Positions** menu, you can:
 
 ### **Bot is Not Posting Orders**
 - Ensure your API keys are correct in `.env`.  
-- Check logs for `Error fetching active orders` messages.  
-- Verify **market vig** is within the allowed limit. 
+- Check logs for `Error` messages.  
+- Verify **market vig** is within the allowed limit, and that there are active orders which meet your threshold. 
 
 ### **How to Stop the Bot**
 - Use `CTRL+C` to stop execution.  
