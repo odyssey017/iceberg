@@ -396,6 +396,8 @@ async function processMarket(marketHash, config) {
             logToFile(`⚠️ Skipping order post due to active order fetch failure.`);
             return;
         }
+
+        const sizeToPost = Math.min(remainingNeeded, increments);
   
         logToFile(`🆕 Posting new order (${sizeToPost.toFixed(4)} units)`);
         await postOrderForPosition(marketHash, outcome, sizeToPost, edge, minOrderSize);
