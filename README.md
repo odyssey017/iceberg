@@ -1,9 +1,9 @@
-# 🧊 Iceberg Betting Bot
+# 🧊 Iceberg Order Betting Bot
 
 ## 📌 Overview
-The **Iceberg Trading Bot** is an automated betting tool for **SX Bet**.  
+The **Iceberg Bot** is an automated betting tool for **SX Bet**.  
 
-The bot allows users to programmatically create and manage orders at a specificed edge above the current top available odds on the orderbook using an "iceberg" strategy, where large bets are split into smaller increments. It continuously monitors the order book, adjusting or canceling orders based on market conditions, vig thresholds, and order fills to ensure efficient execution without an odds feed. The bot runs through an interactive CLI, allowing users to create, manage, and monitor trading positions in real time.
+The bot allows the user to programmatically create and manage orders at a specificed edge above the current top available odds on the orderbook using an "iceberg" strategy, where large bets are split into smaller increments. It continuously monitors the order book, adjusting or canceling orders based on market conditions, vig thresholds, and order fills to ensure efficient execution without an odds feed. The bot runs through an interactive CLI, allowing users to create, manage, and monitor trading positions in real time.
 
 ---
 
