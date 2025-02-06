@@ -10,14 +10,18 @@
  *  1. Run "node iceberg.js"
  */
 
+// ===================== IMPORTS & SETUP =====================
 import * as readlineSync from "readline-sync";
 import { fork } from "child_process";
 import fs from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
 import fetch from "node-fetch";
+import { API_BASE_URL } from "./config.js";
+import { fileURLToPath } from "url";
 
-// Add at top of file
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const CLI_THEME = {
   icons: {
     header: '┏━━━▶ ',
@@ -43,65 +47,13 @@ const CLI_THEME = {
   }
 };
 
-// New display helpers
 function showHeader(title) {
-    console.log(`\n${CLI_THEME.icons.header}${title}`);
-    console.log(CLI_THEME.icons.divider);
-}
-  
-  function showFooter(message) {
-    console.log(`${CLI_THEME.icons.footer}${message}\n`);
+  console.log(`\n${CLI_THEME.icons.header}${title}`);
+  console.log(CLI_THEME.icons.divider);
 }
 
-// ===================== CONFIG =====================
-const API_BASE_URL = "https://api.sx.bet";
-
-// ===================== FILE PATHS =====================
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const LOG_FILE_PATH = path.resolve(__dirname, "main.log");
-
-// Ensure the log directory exists
-if (!fs.existsSync(path.dirname(LOG_FILE_PATH))) {
-  fs.mkdirSync(path.dirname(LOG_FILE_PATH), { recursive: true });
-}
-
-// Initialize the log file
-fs.writeFileSync(LOG_FILE_PATH, "=== Main Script Log ===\n", { flag: 'w' });
-
-/**
- * Logs a message to both the console and the log file.
- *
- * @param {string} message - The message to log.
- */
-function log(message) {
-  const timestamp = new Date().toISOString();
-  const logMessage = `[${timestamp}] ${message}\n`;
-  
-  // Append to log file asynchronously
-  fs.appendFile(LOG_FILE_PATH, logMessage, (err) => {
-    if (err) {
-      console.error(`Failed to write to main log file: ${err.message}`);
-    }
-  });
-  
-  // Also log to console
-  console.log(`[${timestamp}] ${message}`);
-}
-
-function logToFile(message) {
-  const timestamp = new Date().toISOString();
-  const logMessage = `[${timestamp}] ${message}\n`;
-  
-  // Asynchronous append to the log file
-  fs.appendFile(LOG_FILE_PATH, logMessage, (err) => {
-    if (err) {
-      console.error(`Failed to write to log file: ${err.message}`);
-    }
-  });
-  
-  // Also log to console
-  console.log(`[${timestamp}] ${message}`);
+function showFooter(message) {
+  console.log(`${CLI_THEME.icons.footer}${message}\n`);
 }
 
 // ===================== CHILD PROCESS MANAGEMENT =====================
@@ -117,27 +69,20 @@ function ensureMonitoringProcess() {
     monitoringProcess = fork(path.join(__dirname, "monitor.js"));
 
     monitoringProcess.on("message", (msg) => {
-      // Optionally handle messages from the child here if needed
-      logToFile(`Parent received message from monitoring: ${JSON.stringify(msg)}`);
     });
 
     monitoringProcess.on("error", (err) => {
-      logToFile(`Monitoring process error: ${err.message}`);
     });
 
     monitoringProcess.on("exit", (code, signal) => {
-      logToFile(`Monitoring process exited with code ${code} and signal ${signal}`);
       monitoringProcess = null;
     });
-
-    logToFile("Monitoring process started.");
   }
 }
 
 process.on("exit", () => {
   if (monitoringProcess) {
     monitoringProcess.kill();
-    logToFile("Monitoring process terminated.");
   }
 });
 
@@ -154,7 +99,6 @@ async function fetchLeagues() {
     const data = await response.json();
     return data.data || [];
   } catch (error) {
-    logToFile(`Error fetching leagues: ${error.message}`);
     return [];
   }
 }
@@ -217,7 +161,6 @@ async function fetchActiveMarkets(leagueId) {
 
     return detailedMarkets;
   } catch (error) {
-    logToFile(`Error fetching active markets: ${error.message}`);
     return [];
   }
 }
@@ -274,7 +217,6 @@ async function fetchMarketOdds(marketHash) {
 
     return { bestTakerOddsForOutcome1, bestTakerOddsForOutcome2 };
   } catch (error) {
-    logToFile(`Error fetching market odds for ${marketHash}: ${error.message}`);
     return { bestTakerOddsForOutcome1: 0, bestTakerOddsForOutcome2: 0 };
   }
 }
@@ -311,13 +253,6 @@ function startMonitoringPosition(position) {
   });
 }
 
-function formatMarket(market, index) {
-    return `
-  ${CLI_THEME.icons.section} ${index + 1}. ${market.teamOneName} vs ${market.teamTwoName}
-  ${CLI_THEME.icons.section}    ${market.outcomeOneName.padEnd(20)} | ${market.outcomeTwoName.padEnd(20)}
-  ${CLI_THEME.icons.section}    ${'-'.repeat(45)}`;
-}
-
 /**
  * If user wants to stop monitoring a particular market
  */
@@ -326,11 +261,10 @@ function stopMonitoringPosition(marketHash) {
     monitoringProcess.send({ action: "stop", marketHash });
   }
   positions.delete(marketHash);
-  logToFile(`Stopped monitoring market ${marketHash}`);
 }
 
 async function viewLogs() {
-    const LOG_FILE_PATH = path.resolve(__dirname, "main.log");
+    const LOG_FILE_PATH = path.resolve(__dirname, "monitoring.log");
 
     if (!fs.existsSync(LOG_FILE_PATH)) {
         console.log(`${CLI_THEME.icons.alert} No logs found.`);
@@ -374,7 +308,6 @@ function stopAllPositions() {
     monitoringProcess.send({ action: "stopAll" });
   }
   positions.clear();
-  logToFile("Stopped monitoring all markets");
 }
 
 // ===================== MAIN MENU LOGIC =====================
@@ -414,10 +347,6 @@ async function mainMenu() {
     }
 }
 
-
-/**
- * Prompt user for the details needed to build a position, then start monitoring.
- */
 /**
  * Prompt user for the details needed to build a position, then start monitoring.
  */
@@ -576,11 +505,7 @@ async function buildPosition() {
     console.log(`\n${CLI_THEME.icons.success} ✅ Position created successfully!`);
     console.log(`${CLI_THEME.icons.success} Ignoring orders ≤ ${minOrderSize} units`);
     showFooter(`Monitoring ${selectedMarket.teamOneName} vs ${selectedMarket.teamTwoName}`);
-    logToFile(`Position created: ${JSON.stringify(position)}`);
 }
-
-
-
 
 /**
  * Manage positions: either edit or close them. 
@@ -663,7 +588,6 @@ async function managePositions() {
         }
 
         console.log(`Position updated for market: ${chosenHash}`);
-        logToFile(`Position updated: ${JSON.stringify(chosenPos)}`);
     } else if (action === 2) {
         // Close position => stop monitoring, remove from map
         stopMonitoringPosition(chosenHash);
@@ -671,10 +595,7 @@ async function managePositions() {
     } else {
         console.log("Invalid action.");
     }
-} // <-- Properly closes the function!
-
-
-
+}
 
 // Start the CLI
 mainMenu();
