@@ -160,7 +160,7 @@ Run the following command to install required packages:
 npm install
 ```
 
-### **4️⃣ Configure Your API Key, Private Key, & Wallet Address **  
+### **4️⃣ Configure Your API Key, Private Key, & Wallet Address**  
 1. **Create a `.env` file** in the root directory.  
 2. Add your **SX Bet API credentials** inside `.env`:
 
