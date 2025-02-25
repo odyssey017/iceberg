@@ -65,20 +65,41 @@ let monitoringProcess = null;
  */
 function ensureMonitoringProcess() {
   if (!monitoringProcess) {
-    // monitoring.js should be the second file in this project
     monitoringProcess = fork(path.join(__dirname, "monitor.js"));
 
     monitoringProcess.on("message", (msg) => {
+
+      if (!msg || !msg.action) return;
+
+      if (msg.action === "updateFill") {
+        if (positions.has(msg.marketHash)) {
+          const position = positions.get(msg.marketHash);
+          position.currentFill = msg.currentFill;
+        }
+      }
+
+      if (msg.action === "markFilled") {
+        if (positions.has(msg.marketHash)) {
+          const completedPos = positions.get(msg.marketHash);
+          completedPos.currentFill = completedPos.maxFill;
+
+          completedPositions.set(msg.marketHash, completedPos);
+          positions.delete(msg.marketHash);
+        }
+      }
     });
 
     monitoringProcess.on("error", (err) => {
+      console.error("Monitoring process error:", err);
     });
 
     monitoringProcess.on("exit", (code, signal) => {
+      console.log("Monitoring process exited:", code, signal);
       monitoringProcess = null;
     });
   }
 }
+  
 
 process.on("exit", () => {
   if (monitoringProcess) {
@@ -237,8 +258,11 @@ function calculateVig(p1, p2) {
 }
 
 // ===================== POSITION STORAGE =====================
-// In memory for demonstration. Typically you'd persist this to a DB or file.
+// Active positions
 const positions = new Map();
+
+// Completed positions
+const completedPositions = new Map();
 
 /**
  * After building a position config, we notify the monitoring process
@@ -336,8 +360,19 @@ async function mainMenu() {
                 break;
             case 4:
                 console.log("Exiting the bot. Goodbye!");
-                stopAllPositions(); 
-                process.exit(0);
+                  
+                stopAllPositions();
+                  
+                if (monitoringProcess) {
+                      monitoringProcess.on("exit", () => {
+                        process.exit(0);
+                      });
+                    } else {
+                      process.exit(0);
+                    }
+                  
+                    return;
+                  
             case 0:
                 console.log("Returning to main menu...");
                 continue;
@@ -487,8 +522,10 @@ async function buildPosition() {
         outcomeTwoName: selectedMarket.outcomeTwoName
     };
 
+    const normalizedHash = selectedMarket.marketHash.toLowerCase();
+
     const position = {
-        marketHash: selectedMarket.marketHash,
+        marketHash: normalizedHash,
         outcome,
         maxFill,
         increments,
@@ -499,7 +536,7 @@ async function buildPosition() {
         marketDetails
     };
 
-    positions.set(selectedMarket.marketHash, position);
+    positions.set(normalizedHash, position);
     startMonitoringPosition(position);
 
     console.log(`\n${CLI_THEME.icons.success} ✅ Position created successfully!`);
@@ -511,91 +548,124 @@ async function buildPosition() {
  * Manage positions: either edit or close them. 
  */
 async function managePositions() {
+    if (monitoringProcess) {
+        console.log("Refreshing fill data for all monitored positions...");
+
+        monitoringProcess.send({ action: "forceRefreshAll" });
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+    } else {
+        console.log("Monitoring process not running; cannot refresh data.");
+    }
+
     console.log(`${CLI_THEME.icons.footer} Press 0 to return to the main menu at any time.`);
-    if (positions.size === 0) {
-        console.log(`${CLI_THEME.icons.section} 🧊 No active iceberg positions found`);
+    
+    if (positions.size === 0 && completedPositions.size === 0) {
+        console.log(`${CLI_THEME.icons.section} 🧊 No active or completed iceberg positions found`);
         showFooter('Returning to main menu');
         return;
     }
 
-    // Get array of position hashes
-    const hashes = [...positions.keys()];
-    
-    // List positions with numbers
-    hashes.forEach((hash, idx) => {
-        const pos = positions.get(hash);
-        const progress = (pos.currentFill / pos.maxFill) * 100;
-        console.log(`
+    // 🔵 Active Positions
+    const activePositionsList = Array.from(positions.values()).map(pos => {
+        // Ensure currentFill is always a number
+        const currentFill = pos.currentFill || 0;  
+        const progress = (currentFill / pos.maxFill) * 100;
+
+        return { pos, progress, hash: pos.marketHash };
+    });
+
+    // ✅ Completed Positions
+    const completedPositionsList = Array.from(completedPositions.values());
+
+    // Display Active Positions
+    if (activePositionsList.length > 0) {
+        showHeader("🔍 Active Iceberg Positions");
+        activePositionsList.forEach(({ pos, progress }, idx) => {
+            console.log(`
     ${CLI_THEME.icons.section} ${idx + 1}. ${pos.marketDetails.teamOneName} vs ${pos.marketDetails.teamTwoName}
     ${CLI_THEME.icons.section}    Betting: ${pos.outcome === 1 ? pos.marketDetails.outcomeOneName : pos.marketDetails.outcomeTwoName}
     ${CLI_THEME.icons.section}    ${CLI_THEME.icons.progress(progress)}
-    ${CLI_THEME.icons.section}    ──────────────────────────────────────
-    ${CLI_THEME.icons.section}    💰 Filled: ${pos.currentFill}/${pos.maxFill} 
+    ${CLI_THEME.icons.section}    💰 Filled: ${pos.currentFill || 0}/${pos.maxFill} 
     ${CLI_THEME.icons.section}    🎯 Edge: ${pos.edge}% | 🛡️ Vig Limit: ${(pos.maxVig * 100).toFixed(1)}%
     ${CLI_THEME.icons.section}    ⚖️  Min Order: ${pos.minOrderSize} | 🔄 Increments: ${pos.increments}`);
-    });
+        });
+    } else {
+        console.log(`${CLI_THEME.icons.section} 🔹 No active positions.`);
+    }
+
+    // Display Completed Positions
+    if (completedPositionsList.length > 0) {
+        showHeader("✅ Completed Iceberg Positions");
+        completedPositionsList.forEach((pos, idx) => {
+            const progress = 100;
+            console.log(`
+    ${CLI_THEME.icons.success} ✅ ${idx + 1}. ${pos.marketDetails.teamOneName} vs ${pos.marketDetails.teamTwoName}
+    ${CLI_THEME.icons.section}    Betting: ${pos.outcome === 1 ? pos.marketDetails.outcomeOneName : pos.marketDetails.outcomeTwoName}
+    ${CLI_THEME.icons.section}    ${CLI_THEME.icons.progress(progress)}
+    ${CLI_THEME.icons.section}    💰 Filled: ${pos.currentFill || pos.maxFill}/${pos.maxFill} (100% Completed)`);
+        });
+    } else {
+        console.log(`${CLI_THEME.icons.section} 🔹 No fully filled positions.`);
+    }
 
     showFooter('Select position to manage');
     
-    // Get user input and validate
     const choice = readlineSync.questionInt("Enter position number: ");
-    const choiceIndex = choice - 1;
-    
-    if (choiceIndex < 0 || choiceIndex >= hashes.length) {
-        console.log("Invalid choice.");
-        return;
-    }
+    if (choice === 0) return;
 
-    const chosenHash = hashes[choiceIndex];
-    const chosenPos = positions.get(chosenHash);
+    // Handle selection for active positions
+    if (choice <= activePositionsList.length) {
+        const chosen = activePositionsList[choice - 1];
+        const chosenHash = chosen.hash;
+        const chosenPos = positions.get(chosenHash);
 
-    console.log("\n1. Edit Position");
-    console.log("2. Close Position");
-    const action = readlineSync.questionInt("Choose an action: ");
+        console.log("\n1. Edit Position");
+        console.log("2. Close Position");
+        const action = readlineSync.questionInt("Choose an action: ");
 
-    if (action === 1) {
-        // Edit position: allow user to update edge, increments, maxFill, maxVig
-        const newEdge = readlineSync.questionFloat(
-            `Enter new edge % (current: ${chosenPos.edge}). Press enter to skip: `,
-            { defaultInput: String(chosenPos.edge) }
-        );
-        const newIncrements = readlineSync.questionFloat(
-            `Enter new increments (current: ${chosenPos.increments}). Press enter to skip: `,
-            { defaultInput: String(chosenPos.increments) }
-        );
-        const newMaxFill = readlineSync.questionFloat(
-            `Enter new max fill (current: ${chosenPos.maxFill}). Press enter to skip: `,
-            { defaultInput: String(chosenPos.maxFill) }
-        );
-        const newMaxVig = readlineSync.questionFloat(
-            `Enter new max vig (current: ${chosenPos.maxVig}). Press enter to skip: `,
-            { defaultInput: String(chosenPos.maxVig) }
-        );
+        if (action === 1) {
+            const newEdge = readlineSync.questionFloat(
+                `Enter new edge % (current: ${chosenPos.edge}). Press enter to skip: `,
+                { defaultInput: String(chosenPos.edge) }
+            );
+            const newIncrements = readlineSync.questionFloat(
+                `Enter new increments (current: ${chosenPos.increments}). Press enter to skip: `,
+                { defaultInput: String(chosenPos.increments) }
+            );
+            const newMaxFill = readlineSync.questionFloat(
+                `Enter new max fill (current: ${chosenPos.maxFill}). Press enter to skip: `,
+                { defaultInput: String(chosenPos.maxFill) }
+            );
+            const newMaxVig = readlineSync.questionFloat(
+                `Enter new max vig (current: ${chosenPos.maxVig}). Press enter to skip: `,
+                { defaultInput: String(chosenPos.maxVig) }
+            );
 
-        chosenPos.edge = newEdge;
-        chosenPos.increments = newIncrements;
-        chosenPos.maxFill = newMaxFill;
-        chosenPos.maxVig = newMaxVig;
-        positions.set(chosenHash, chosenPos); // update in local Map
+            chosenPos.edge = newEdge;
+            chosenPos.increments = newIncrements;
+            chosenPos.maxFill = newMaxFill;
+            chosenPos.maxVig = newMaxVig;
+            positions.set(chosenHash, chosenPos);
 
-        // Notify the monitoring process about the update
-        if (monitoringProcess) {
-            monitoringProcess.send({
-                action: "update",
-                marketHash: chosenHash,
-                config: chosenPos,
-            });
+            if (monitoringProcess) {
+                monitoringProcess.send({
+                    action: "update",
+                    marketHash: chosenHash,
+                    config: chosenPos,
+                });
+            }
+
+            console.log(`Position updated for market: ${chosenHash}`);
+        } else if (action === 2) {
+            stopMonitoringPosition(chosenHash);
+            console.log(`Position closed for market: ${chosenHash}`);
+        } else {
+            console.log("Invalid action.");
         }
-
-        console.log(`Position updated for market: ${chosenHash}`);
-    } else if (action === 2) {
-        // Close position => stop monitoring, remove from map
-        stopMonitoringPosition(chosenHash);
-        console.log(`Position closed for market: ${chosenHash}`);
-    } else {
-        console.log("Invalid action.");
     }
 }
+
+
 
 // Start the CLI
 mainMenu();
