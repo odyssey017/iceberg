@@ -9,6 +9,7 @@
  *    3. Check if we've reached the max fill. If so, stop monitoring.
  *    4. Check if the market vig is above the user’s limit; if above, cancel orders.
  */
+
 import fetch from "node-fetch";
 import dotenv from "dotenv";
 import BigNumber from "bignumber.js";
@@ -24,7 +25,14 @@ import { fetchWithTimeout, fetchActiveOrders, cancelOrdersForMonitoring } from "
 dotenv.config();
 
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
-const MAKER_ADDRESS = process.env.USER_ADDRESS;
+const MAKER_ADDRESS = process.env.USER_ADDRESS.toLowerCase();
+
+// *** NEW: We’ll store the last time we posted an order per market to enforce a “cool-down” ***
+const COOL_DOWN_MS = 5000; // e.g. 5 seconds
+const lastPostTimes = new Map(); // { marketHash => timestamp }
+
+// *** NEW: We’ll allow a small fill tolerance so if we’re 99% filled, we treat it as done ***
+const FILL_TOLERANCE = 0.99; // i.e. 99% fill is considered "complete"
 
 // ===================== WEBSOCKET (ORDERBOOK) =====================
 const ablyClient = new Ably.Realtime({
@@ -41,10 +49,18 @@ const ablyClient = new Ably.Realtime({
   },
 });
 
+// Subscribe to the channel that tracks your own orders' fill changes
+subscribeToActiveOrders();
+
 const orderBooks = new Map();
 
+// A helper structure to track fill amounts across multiple user orders in the same market
+const userOrdersByMarket = new Map(); 
+// shape: { marketHash => { orderHash => fill, ... }, ... }
+
+// ===================== SUBSCRIBE TO ORDER BOOK =====================
 async function subscribeToOrderBook(marketHash) {
-  const token = "0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B"; // Update with your SX token
+  const token = "0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B"; // SX token
   const channel = ablyClient.channels.get(`order_book:${token}:${marketHash}`);
 
   logToFile(`🔍 Subscribing to WebSocket order book: order_book:${token}:${marketHash}`);
@@ -61,12 +77,81 @@ async function subscribeToOrderBook(marketHash) {
   logToFile(`✅ Subscribed to order book for market: ${marketHash}`);
 }
 
+// ===================== SUBSCRIBE TO YOUR ACTIVE ORDERS =====================
+/**
+ * Whenever an order's fillAmount changes, update our userFills map.
+ *
+ * *** Fix applied ***: If an order is INACTIVE, we finalize the fill so
+ * getLocalFillForMarket() sees the matched volume.
+ */
+function subscribeToActiveOrders() {
+  const token = BASE_TOKEN.toLowerCase();
+  const user = MAKER_ADDRESS.toLowerCase();
+
+  const channelName = `active_orders:${token}:${user}`;
+  const channel = ablyClient.channels.get(channelName);
+
+  logToFile(`🔔 Subscribing to active orders channel: ${channelName}`);
+
+  channel.subscribe((message) => {
+    logToFile(`🔔 active_orders update => ${JSON.stringify(message.data)}`);
+
+    if (!Array.isArray(message.data)) return;
+
+    for (const row of message.data) {
+      // row format: [orderHash, marketHash, status, fillAmount, totalBetSize, ...]
+      const orderHash = row[0];
+      const marketHash = row[1];
+      const status = row[2];
+      const fillAmountBN = new BigNumber(row[3]);
+      const totalBetSizeBN = new BigNumber(row[4]);
+
+      const fillAmount = fillAmountBN.div(1e6).toNumber();
+      const totalBetSize = totalBetSizeBN.div(1e6).toNumber();
+
+      logToFile(`Order ${orderHash} for market ${marketHash} fillAmount=${fillAmount}`);
+      updateUserOrderFill(marketHash, orderHash, fillAmount);
+
+      if (status === "INACTIVE") {
+        logToFile(`Order ${orderHash} is INACTIVE for ${marketHash}, fill=${fillAmount}/${totalBetSize}`);
+
+        // If near full, treat it as final fill
+        const nearFull = fillAmount >= totalBetSize * 0.99;
+        const finalFill = nearFull ? totalBetSize : fillAmount;
+
+        // Overwrite the fill with finalFill so we don’t lose it
+        updateUserOrderFill(marketHash, orderHash, finalFill);
+
+        // Optionally remove it from the map if you prefer:
+        // removeUserOrderFromMap(marketHash, orderHash);
+      }
+    }
+  });
+}
+
+function updateUserOrderFill(marketHash, orderHash, fill) {
+  let ordersMap = userOrdersByMarket.get(marketHash);
+  if (!ordersMap) {
+    ordersMap = new Map();
+    userOrdersByMarket.set(marketHash, ordersMap);
+  }
+  ordersMap.set(orderHash, fill);
+}
+
+function removeUserOrderFromMap(marketHash, orderHash) {
+  let ordersMap = userOrdersByMarket.get(marketHash);
+  if (ordersMap) {
+    ordersMap.delete(orderHash);
+  }
+}
+
+// ===================== FETCH INITIAL ORDER BOOK =====================
 async function fetchInitialOrderBook(marketHash) {
   try {
     const url = `${API_BASE_URL}/orders?marketHashes=${marketHash}`;
     logToFile(`🔍 Fetching initial order book from API: ${url}`);
 
-    const response = await fetchWithTimeout(url, {}, 5000); // 5-second timeout
+    const response = await fetchWithTimeout(url, {}, 5000); // 5s timeout
     if (!response.ok) {
       throw new Error(`Failed to fetch initial order book: ${response.statusText}`);
     }
@@ -76,8 +161,8 @@ async function fetchInitialOrderBook(marketHash) {
       throw new Error(`Invalid order book data format received.`);
     }
 
-    // Convert API data to WebSocket format (if necessary)
-    const formattedOrders = data.data.map(order => [
+    // Convert API data to WebSocket format if needed
+    const formattedOrders = data.data.map((order) => [
       order.orderHash,
       "ACTIVE",
       order.fillAmount,
@@ -94,7 +179,6 @@ async function fetchInitialOrderBook(marketHash) {
       order.sportXeventId,
     ]);
 
-    // Store orders in our order book map
     handleOrderBookUpdate(marketHash, formattedOrders);
     logToFile(`✅ Initial order book fetched for ${marketHash}. Orders: ${formattedOrders.length}`);
   } catch (err) {
@@ -102,226 +186,250 @@ async function fetchInitialOrderBook(marketHash) {
   }
 }
 
+/**
+ * handleOrderBookUpdate
+ * 
+ * Now includes logic to detect if your own order is INACTIVE with a final fill,
+ * so we can record it in userOrdersByMarket (similar to subscribeToActiveOrders).
+ */
 function handleOrderBookUpdate(marketHash, orders, minOrderSize = 100) {
     if (!orderBooks.has(marketHash)) {
-        orderBooks.set(marketHash, []);
+      orderBooks.set(marketHash, []);
     }
   
     const orderBook = orderBooks.get(marketHash);
-    const newOrderBook = [];
+    const newOrders = [];
+    let validExternalCount = 0;
   
-    let validOrders = 0;
+    for (const o of orders) {
+      // The raw array structure from your WebSocket or fetch:
+      // [ orderHash, status, fillAmount, maker, totalBetSize, percentageOdds, expiry, apiExpiry, salt, isMakerBettingOutcomeOne, signature, updateTime, chainVersion, sportXeventId ]
+      const orderHash      = o[0];
+      const status         = o[1]; // "ACTIVE", "INACTIVE", ...
+      const fillAmountBN   = new BigNumber(o[2]); // final or partial fill (micro-units)
+      const makerAddr      = o[3].toLowerCase();
+      const rawTotalBN     = new BigNumber(o[4]); // totalBetSize in micro-units
   
-    for (const order of orders) {
-        const rawSize = new BigNumber(order[4]); // Raw order size
-        const orderSize = rawSize.div(1e6); // Convert units properly
+      const fillAmount     = fillAmountBN.div(1e6).toNumber();
+      const totalBetSize   = rawTotalBN.div(1e6).toNumber();
   
-        // Ignore small orders AND bot's own orders
-        if (orderSize.lt(minOrderSize) || order[3] === MAKER_ADDRESS) {
-            logToFile(`🚫 Ignoring small order: ${order[0]} (${orderSize.toFixed(4)} units)`);
-            continue;
+      const percentageOdds = o[5];
+      const isMakerBettingOutcomeOne = o[9];
+      const isMyOrder = (makerAddr === MAKER_ADDRESS);
+  
+      // Ignore small external orders
+      if (!isMyOrder && totalBetSize < minOrderSize) {
+        logToFile(`🚫 Ignoring small external order: ${orderHash} (${totalBetSize.toFixed(4)} units)`);
+        continue;
+      }
+  
+      // *** If your order is INACTIVE with a non-zero fill, treat that as a final fill. ***
+      if (isMyOrder && status === "INACTIVE") {
+        if (fillAmount > 0) {
+          // e.g. partial or full fill. You can also do a "nearFull" check if you want:
+          logToFile(`🔔 handleOrderBookUpdate => My order ${orderHash} is INACTIVE with fill=${fillAmount}/${totalBetSize}. Finalizing fill.`);
+          updateUserOrderFill(marketHash, orderHash, fillAmount);
+        } else {
+          // fillAmount=0 => likely canceled with no fill
+          logToFile(`🔔 handleOrderBookUpdate => My order ${orderHash} is INACTIVE but fill=0 => canceled, not finalizing fill.`);
         }
+      }
   
-        newOrderBook.push({
-            orderHash: order[0],
-            status: order[1],
-            maker: order[3],
-            totalBetSize: orderSize.toFixed(4),
-            percentageOdds: order[5],
-            expiry: order[6],
-            isMakerBettingOutcomeOne: order[9],
-            updateTime: order[11]
-        });
+      // Store the order in our local array for top-of-book or vig calculations
+      newOrders.push({
+        orderHash: orderHash,
+        status: status,
+        maker: makerAddr,
+        isMyOrder,
+        totalBetSize: totalBetSize.toFixed(4),
+        percentageOdds: percentageOdds,
+        isMakerBettingOutcomeOne
+        // ... add other fields if needed
+      });
   
-        validOrders++;
+      // Count external ACTIVE orders for your top-of-book logic
+      if (!isMyOrder && status === "ACTIVE") {
+        validExternalCount++;
+      }
     }
   
-    // ✅ **Instead of overwriting, merge new valid orders with existing orders**
-    orderBooks.set(marketHash, [...orderBook, ...newOrderBook]);
-  
-    logToFile(`📡 Order book updated for market: ${marketHash}. Valid orders: ${validOrders}`);
+    // Merge these new orders with any existing ones we keep
+    orderBooks.set(marketHash, [...orderBook, ...newOrders]);
+    logToFile(`📡 Order book updated for ${marketHash}. Valid external orders: ${validExternalCount}`);
 }
+  
+  
 
 // ===================== ORDERBOOK PROCESSING & CALCULATIONS =====================
 function getMarketDataFromOrderBook(marketHash, isUserBettingOutcomeOne, minOrderSize = 100) {
-    const orders = orderBooks.get(marketHash) || [];
-    let bestMakerProbOpposite = 0;
-    let validOrders = 0;
-  
-    for (const order of orders) {
-      const orderSize = new BigNumber(order.totalBetSize); // Already converted in `handleOrderBookUpdate`
-  
-      if (orderSize.lt(minOrderSize)) {
-        logToFile(`🚫 Ignoring small order for market odds: ${order.orderHash} (${orderSize.toFixed(4)} units)`);
-        continue;
+  const allOrders = orderBooks.get(marketHash) || [];
+  let bestMakerProbOpposite = 0;
+  let validExternal = 0;
+
+  for (const ord of allOrders) {
+    if (ord.isMyOrder) continue;
+
+    const sizeBN = new BigNumber(ord.totalBetSize);
+    if (sizeBN.lt(minOrderSize)) continue;
+
+    if (ord.isMakerBettingOutcomeOne !== isUserBettingOutcomeOne) {
+      const probability = parseFloat(ord.percentageOdds) / 1e20;
+      if (probability > bestMakerProbOpposite) {
+        bestMakerProbOpposite = probability;
       }
-  
-      if (order.isMakerBettingOutcomeOne !== isUserBettingOutcomeOne) {
-        const probability = parseFloat(order.percentageOdds) / 1e20;
-        if (probability > bestMakerProbOpposite) {
-          bestMakerProbOpposite = probability;
-        }
-        validOrders++;
-      }
+      validExternal++;
     }
-  
-    const bestTakerOdds = 1 - bestMakerProbOpposite;
-    logToFile(`📊 Found ${validOrders} valid orders for market ${marketHash}`);
-    return { bestTakerOdds, vig: getVigFromOrderBook(marketHash, minOrderSize) };
+  }
+
+  const bestTakerOdds = 1 - bestMakerProbOpposite;
+  const vig = getVigFromOrderBook(marketHash, minOrderSize);
+
+  logToFile(`📊 Found ${validExternal} valid external orders for market ${marketHash}`);
+  return { bestTakerOdds, vig };
 }
 
 function getVigFromOrderBook(marketHash, minOrderSize = 100) {
-    const orders = orderBooks.get(marketHash) || [];
-    let bestMakerProbO1 = 0, bestMakerProbO2 = 0;
-    let validOrders = 0;
-  
-    for (const order of orders) {
-      const orderSize = new BigNumber(order.totalBetSize);
-  
-      if (orderSize.lt(minOrderSize)) {
-        logToFile(`🚫 Ignoring small order for vig calculation: ${order.orderHash} (${orderSize.toFixed(4)} units)`);
-        continue;
-      }
-  
-      const probability = parseFloat(order.percentageOdds) / 1e20;
-      if (order.isMakerBettingOutcomeOne) {
-        bestMakerProbO1 = Math.max(bestMakerProbO1, probability);
-      } else {
-        bestMakerProbO2 = Math.max(bestMakerProbO2, probability);
-      }
-  
-      validOrders++;
+  const allOrders = orderBooks.get(marketHash) || [];
+  let bestMakerProbO1 = 0, bestMakerProbO2 = 0;
+  let validCount = 0;
+
+  for (const ord of allOrders) {
+    if (ord.isMyOrder) continue;
+
+    const sizeBN = new BigNumber(ord.totalBetSize);
+    if (sizeBN.lt(minOrderSize)) continue;
+
+    const probability = parseFloat(ord.percentageOdds) / 1e20;
+    if (ord.isMakerBettingOutcomeOne) {
+      bestMakerProbO1 = Math.max(bestMakerProbO1, probability);
+    } else {
+      bestMakerProbO2 = Math.max(bestMakerProbO2, probability);
     }
-  
-    if (validOrders === 0) {
-      logToFile(`⚠️ No valid orders found for vig calculation in ${marketHash}. Returning default vig.`);
-      return 0.0; // Default to 0 if no valid orders
-    }
-  
-    const bestTakerOddsO1 = 1 - bestMakerProbO2;
-    const bestTakerOddsO2 = 1 - bestMakerProbO1;
-    const vig = (bestTakerOddsO1 + bestTakerOddsO2) - 1;
-  
-    logToFile(`📈 Vig Calculation for ${marketHash}: BestTakerOddsO1=${bestTakerOddsO1.toFixed(6)}, BestTakerOddsO2=${bestTakerOddsO2.toFixed(6)}, Vig=${vig.toFixed(6)}`);
-  
-    return vig;
+    validCount++;
+  }
+
+  if (validCount === 0) {
+    logToFile(`⚠️ No valid external orders found for vig in ${marketHash}. Returning default vig=0.`);
+    return 0.0;
+  }
+
+  const bestTakerOddsO1 = 1 - bestMakerProbO2;
+  const bestTakerOddsO2 = 1 - bestMakerProbO1;
+  const vig = (bestTakerOddsO1 + bestTakerOddsO2) - 1;
+
+  logToFile(`📈 Vig Calculation: O1=${bestTakerOddsO1.toFixed(6)}, O2=${bestTakerOddsO2.toFixed(6)}, Vig=${vig.toFixed(6)}`);
+  return vig;
 }
 
 function roundDownOddsToNearestStep(oddsBigNum) {
-    // For example, step = 0.0025 => scaled step = 0.0025 * 1e20 = 2.5e17
-    const step = new BigNumber(ODDS_LADDER_STEP_SIZE).times(IMPLIED_ODDS_MULTIPLIER);
-    return oddsBigNum.div(step).integerValue(BigNumber.ROUND_FLOOR).times(step);
+  const step = new BigNumber(ODDS_LADDER_STEP_SIZE).times(IMPLIED_ODDS_MULTIPLIER);
+  return oddsBigNum.div(step).integerValue(BigNumber.ROUND_FLOOR).times(step);
 }
 
-// MONITORING CONFIG
+// ===================== MONITORING CONFIG & ORDER POSTING =====================
 const monitoringConfig = new Map();
 
-// ===================== ORDER EXECUTION & MANAGEMENT =====================
 async function postOrderForPosition(marketHash, outcome, amount, edge, minOrderSize = 100) {
+  if (!monitoringConfig.has(marketHash)) {
+    logToFile(`🚨 Failsafe triggered: Market ${marketHash} is no longer monitored. Skipping order.`);
+    return null;
+  }
+
+  // COOL-DOWN CHECK
+  const lastPosted = lastPostTimes.get(marketHash) || 0;
+  if (Date.now() - lastPosted < COOL_DOWN_MS) {
+    logToFile(`⌛ Market ${marketHash} is in cool-down. Skipping post.`);
+    return null;
+  }
+
+  try {
+    const { bestTakerOdds } = getMarketDataFromOrderBook(marketHash, outcome === 1, minOrderSize);
+    if (!bestTakerOdds || bestTakerOdds <= 0 || bestTakerOdds >= 1) {
+      logToFile(`⚠️ No valid taker odds for market ${marketHash}, outcome ${outcome}. Skipping post.`);
+      return null;
+    }
+
+    const adjustedTakerOdds = bestTakerOdds * (1 - edge / 100);
+    const newMakerProb = adjustedTakerOdds;
+
+    if (newMakerProb <= 0 || newMakerProb >= 1) {
+      logToFile(`🚨 Invalid makerProb=${newMakerProb} for market ${marketHash}. Skipping.`);
+      return null;
+    }
+
+    logToFile(`📝 Preparing to post order for ${marketHash}, outcome=${outcome}, adjustedTakerOdds=${adjustedTakerOdds.toFixed(6)}`);
+
+    let scaledMakerOddsBN = new BigNumber(newMakerProb).times(IMPLIED_ODDS_MULTIPLIER);
+    scaledMakerOddsBN = roundDownOddsToNearestStep(scaledMakerOddsBN);
+    const finalPercentageOdds = scaledMakerOddsBN.toFixed(0);
+
+    const scaledAmount = new BigNumber(amount).times(1e6).toFixed(0);
+
     if (!monitoringConfig.has(marketHash)) {
-      logToFile(`🚨 Failsafe triggered: Market ${marketHash} is no longer monitored. Skipping order.`);
+      logToFile(`🚨 Market ${marketHash} was stopped AFTER calculating order. Aborting.`);
       return null;
     }
-  
-    try {
-      const { bestTakerOdds } = getMarketDataFromOrderBook(marketHash, outcome === 1, minOrderSize);
-      
-      if (!bestTakerOdds || bestTakerOdds <= 0 || bestTakerOdds >= 1) {
-        logToFile(`⚠️ No valid taker odds available for market ${marketHash}, outcome ${outcome}. Skipping post.`);
-        return null;
-      }
-  
-      const adjustedTakerOdds = bestTakerOdds * (1 - edge / 100);
-      const newMakerProb = adjustedTakerOdds;
-  
-      if (newMakerProb <= 0 || newMakerProb >= 1) {
-        logToFile(`🚨 Invalid makerProb=${newMakerProb} for market ${marketHash}. Skipping order.`);
-        return null;
-      }
-  
-      logToFile(`📝 Preparing to post order for ${marketHash}, outcome ${outcome}. Adjusted taker odds: ${adjustedTakerOdds.toFixed(6)}`);
-  
-      let scaledMakerOddsBN = new BigNumber(newMakerProb).times(IMPLIED_ODDS_MULTIPLIER);
-      scaledMakerOddsBN = roundDownOddsToNearestStep(scaledMakerOddsBN);
-      const finalPercentageOdds = scaledMakerOddsBN.toFixed(0);
-  
-      const scaledAmount = new BigNumber(amount).times(new BigNumber(10).pow(6)).toFixed(0);
-  
-      if (!monitoringConfig.has(marketHash)) {
-        logToFile(`🚨 Post-execution check: Market ${marketHash} was stopped AFTER calculating order! Aborting.`);
-        return null;
-      }
-  
-      if (isNaN(Number(scaledAmount))) {
-        logToFile(`Invalid scaledAmount (${scaledAmount}) for market ${marketHash}. Skipping order.`);
-        return null;
-      }
-  
-      const isMakerBettingOutcomeOne = outcome === 1;
-      const saltBytes = randomBytes(32);
-  
-      const order = {
-        marketHash,
-        maker: MAKER_ADDRESS,
-        baseToken: BASE_TOKEN,
-        totalBetSize: scaledAmount,
-        percentageOdds: finalPercentageOdds,
-        apiExpiry: Math.floor(Date.now() / 1000) + 300,
-        expiry: 2209006800,
-        executor: EXECUTOR,
-        isMakerBettingOutcomeOne,
-        salt: `0x${saltBytes.toString("hex")}`,
-      };
-  
-      logToFile(`Order details: ${JSON.stringify(order)}`);
-  
-      const orderHashBytes = getBytes(
-        solidityPackedKeccak256(
-          ["bytes32", "address", "uint256", "uint256", "uint256", "uint256", "address", "address", "bool"],
-          [order.marketHash, order.baseToken, order.totalBetSize, order.percentageOdds, order.expiry, order.salt, order.maker, order.executor, order.isMakerBettingOutcomeOne]
-        )
-      );
-  
-      const wallet = new Wallet(PRIVATE_KEY);
-      order.signature = await wallet.signMessage(orderHashBytes);
-  
-      try {
-        const postUrl = `${API_BASE_URL}/orders/new`;
-        logToFile(`Posting order to URL: ${postUrl}`);
-        const response = await fetchWithTimeout(postUrl, {
-          method: "POST",
-          body: JSON.stringify({ orders: [order] }),
-          headers: { "Content-Type": "application/json" },
-        }, 5000);
-  
-        if (!response.ok) {
-          const errorText = await response.text();
-          logToFile(`Order post error: ${errorText}`);
-          throw new Error(`Failed to post order: ${response.statusText}`);
-        }
-  
-        logToFile(`✅ Successfully posted order for market ${marketHash}, outcome ${outcome}.`);
-  
-        return `0x${Buffer.from(orderHashBytes).toString("hex")}`;
-      } catch (err) {
-        logToFile(`Error in postOrderForPosition: ${err.message}`);
-        return null;
-      }
-    } catch (err) {
-      logToFile(`Error in postOrderForPosition: ${err.message}`);
+
+    if (isNaN(Number(scaledAmount))) {
+      logToFile(`Invalid scaledAmount (${scaledAmount}) for market ${marketHash}. Skipping.`);
       return null;
     }
+
+    const isMakerBettingOutcomeOne = (outcome === 1);
+    const saltBytes = randomBytes(32);
+
+    const order = {
+      marketHash,
+      maker: MAKER_ADDRESS,
+      baseToken: BASE_TOKEN,
+      totalBetSize: scaledAmount,
+      percentageOdds: finalPercentageOdds,
+      apiExpiry: Math.floor(Date.now() / 1000) + 300,
+      expiry: 2209006800,
+      executor: EXECUTOR,
+      isMakerBettingOutcomeOne,
+      salt: `0x${saltBytes.toString("hex")}`
+    };
+
+    logToFile(`Order details => ${JSON.stringify(order)}`);
+
+    const orderHashBytes = getBytes(
+      solidityPackedKeccak256(
+        ["bytes32", "address", "uint256", "uint256", "uint256", "uint256", "address", "address", "bool"],
+        [order.marketHash, order.baseToken, order.totalBetSize, order.percentageOdds, order.expiry, order.salt, order.maker, order.executor, order.isMakerBettingOutcomeOne]
+      )
+    );
+
+    const wallet = new Wallet(PRIVATE_KEY);
+    order.signature = await wallet.signMessage(orderHashBytes);
+
+    const postUrl = `${API_BASE_URL}/orders/new`;
+    logToFile(`Posting order to URL: ${postUrl}`);
+    const response = await fetchWithTimeout(postUrl, {
+      method: "POST",
+      body: JSON.stringify({ orders: [order] }),
+      headers: { "Content-Type": "application/json" },
+    }, 5000);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      logToFile(`Order post error: ${errorText}`);
+      throw new Error(`Failed to post order: ${response.statusText}`);
+    }
+
+    logToFile(`✅ Successfully posted order for ${marketHash}, outcome ${outcome}.`);
+
+    // Update last post time to avoid immediate re-post spam
+    lastPostTimes.set(marketHash, Date.now());
+
+    return `0x${Buffer.from(orderHashBytes).toString("hex")}`;
+  } catch (err) {
+    logToFile(`Error in postOrderForPosition: ${err.message}`);
+    return null;
+  }
 }
 
-// ===================== MONITORING LOGIC =====================
-/**
- * This loop runs continuously, checking each monitored market.
- * For each market:
- *  1. Check the total fill => if >= maxFill, stop monitoring.
- *  2. Check the vig => if > maxVig, cancel orders.
- *  3. If no active order, post our increments.
- *  4. If there's an active order not matching the “desired edge,” cancel & repost.
- */
+// ===================== MONITORING LOOP =====================
 async function monitoringLoop() {
   logToFile("Monitoring loop started.");
   while (true) {
@@ -334,297 +442,216 @@ async function monitoringLoop() {
       }
     }
     logToFile("Monitoring loop iteration completed. Sleeping for 3.5 seconds.");
-    // Sleep for 3.5 seconds before next iteration
     await new Promise((resolve) => setTimeout(resolve, 3500));
   }
 }
 
+/**
+ * getLocalFillForMarket:
+ * Sum the fill for all user orders in the given market from userOrdersByMarket.
+ */
+function getLocalFillForMarket(marketHash) {
+  const ordersMap = userOrdersByMarket.get(marketHash);
+  if (!ordersMap) return 0;
+
+  let totalFill = 0;
+  for (const fill of ordersMap.values()) {
+    totalFill += fill;
+  }
+  return totalFill;
+}
+
 async function processMarket(marketHash, config) {
-  logToFile(`Processing market ${marketHash}: outcome=${config.outcome}, maxFill=${config.maxFill}, increments=${config.increments}, edge=${config.edge}, maxVig=${config.maxVig}, startTime=${config.startTime}, minOrderSize=${config.minOrderSize}`);
+  logToFile(`Processing ${marketHash}: outcome=${config.outcome}, maxFill=${config.maxFill}, increments=${config.increments}, edge=${config.edge}, maxVig=${config.maxVig}, minOrderSize=${config.minOrderSize}`);
 
-  const { outcome, maxFill, increments, edge, maxVig, startTime, minOrderSize } = config;
+  const { outcome, maxFill, increments, edge, maxVig, minOrderSize } = config;
 
-  // 1) Calculate total filled volume
-  const totalFilledBN = await getFilledVolumeSinceStart(marketHash, startTime);
-  const totalFilledBase = totalFilledBN.div(1e6).toNumber(); // Convert to base units
+  // 1) Check total fill
+  const totalFilledBase = getLocalFillForMarket(marketHash);
+  logToFile(`📦 ${marketHash} progress: ${totalFilledBase}/${maxFill} => ${(totalFilledBase / maxFill * 100).toFixed(1)}%`);
 
-  logToFile(`📦 ${marketHash} progress: ${totalFilledBase}/${maxFill} (${((totalFilledBase / maxFill) * 100).toFixed(1)}%)`);
-
-  if (isNaN(totalFilledBase)) {
-      logToFile(`🚨 Total filled volume is NaN for market ${marketHash}. Skipping processing.`);
-      return;
+  // 1a) partial fill tolerance
+  const effectiveFill = totalFilledBase / maxFill;
+  if (effectiveFill >= FILL_TOLERANCE) {
+    logToFile(`✅ Fill tolerance triggered => effectively filled => stopping monitor.`);
+    if (process.send) {
+      process.send({ action: "markFilled", marketHash, currentFill: totalFilledBase });
+    }
+    monitoringConfig.delete(marketHash);
+    return;
   }
 
-  // 2) If remaining fill is less than 10 units, consider it filled and stop monitoring
+  // 1b) If near or at max fill
   const remainingNeeded = maxFill - totalFilledBase;
   if (remainingNeeded < 10) {
-      logToFile(`✅ Remaining fill for ${marketHash} is below 10 units (${remainingNeeded.toFixed(4)}). Marking as fully filled.`);
-      monitoringConfig.delete(marketHash);
-      return;
+    logToFile(`✅ Remaining fill < 10 => done`);
+    if (process.send) {
+      process.send({ action: "markFilled", marketHash, currentFill: maxFill });
+    }
+    monitoringConfig.delete(marketHash);
+    return;
+  } else {
+    if (process.send) {
+      process.send({ action: "updateFill", marketHash, currentFill: totalFilledBase });
+    }
   }
 
-  // 3) Check vig using real-time order book data (WebSocket)
+  // 2) Vig check
   const { bestTakerOdds, vig } = getMarketDataFromOrderBook(marketHash, outcome === 1, minOrderSize);
   if (vig > maxVig) {
-    logToFile(`⚠️ Vig ${vig.toFixed(6)} > maxVig ${maxVig}. Checking order book validity before canceling orders.`);
-  
-    // Double-check the order book before canceling orders
-    const orderBookCheck = orderBooks.get(marketHash);
-    if (!orderBookCheck || orderBookCheck.length === 0) {
-      logToFile(`⚠️ No valid orders in order book for ${marketHash}. Skipping cancel action.`);
-      return;
-    }
-  
-    logToFile(`❌ Canceling orders due to high vig.`);
+    logToFile(`⚠️ Vig ${vig.toFixed(6)} > maxVig ${maxVig}, canceling orders...`);
     const activeOrders = await fetchActiveOrders(marketHash, MAKER_ADDRESS);
     await cancelOrdersForMonitoring(activeOrders.map(o => o.orderHash));
     return;
   }
 
-  // 4) Fetch active orders
-    const activeOrders = await fetchActiveOrders(marketHash, MAKER_ADDRESS, 3);
+  // 3) Fetch your active orders
+  const activeOrders = await fetchActiveOrders(marketHash, MAKER_ADDRESS, 3);
+  if (activeOrders === null) {
+    logToFile(`⚠️ fetchActiveOrders failed => skip cycle.`);
+    return;
+  }
 
-    if (activeOrders.length === 0) {
-        if (remainingNeeded < 10) {
-            logToFile(`🚨 Not posting new order. Remaining size (${remainingNeeded.toFixed(4)}) is below 10 units.`);
-            monitoringConfig.delete(marketHash);
-            return;
-        }
-  
-        // 🛑 **Only post if fetchActiveOrders succeeded!**
-        if (activeOrders === null) {
-            logToFile(`⚠️ Skipping order post due to active order fetch failure.`);
-            return;
-        }
-
-        const sizeToPost = Math.min(remainingNeeded, increments);
-  
-        logToFile(`🆕 Posting new order (${sizeToPost.toFixed(4)} units)`);
-        await postOrderForPosition(marketHash, outcome, sizeToPost, edge, minOrderSize);
-        return;
+  // 3a) If no active orders => post if enough left
+  if (activeOrders.length === 0) {
+    if (remainingNeeded < 10) {
+      logToFile(`🚨 Not posting new order. Remaining size < 10 => done.`);
+      monitoringConfig.delete(marketHash);
+      return;
     }
-  
-
-  // 5) Ensure active orders are at correct edge
-  if (bestTakerOdds <= 0 || bestTakerOdds >= 1) {
-      logToFile(`⚠️ No valid taker odds (or out of range) for market ${marketHash}; skipping cancel/repost.`);
-      return;
+    const sizeToPost = Math.min(remainingNeeded, increments);
+    logToFile(`🆕 No active orders => posting new => ${sizeToPost}`);
+    await postOrderForPosition(marketHash, outcome, sizeToPost, edge, minOrderSize);
+    return;
   }
 
+  // 4) If there are active orders, check if they match the desired edge
+  if (!bestTakerOdds || bestTakerOdds <= 0 || bestTakerOdds >= 1) {
+    logToFile(`⚠️ bestTakerOdds invalid => skip repost.`);
+    return;
+  }
   const desiredTakerOdds = bestTakerOdds * (1 - edge / 100);
-  const desiredMakerProb = desiredTakerOdds;
-  if (isNaN(desiredMakerProb)) {
-      logToFile(`🚨 Invalid desiredMakerProb calculation. Skipping posting.`);
-      return;
+  if (isNaN(desiredTakerOdds)) {
+    logToFile(`🚨 desiredTakerOdds is NaN => skip.`);
+    return;
   }
 
-  const desiredMakerOddsScaled = new BigNumber(desiredMakerProb).times(IMPLIED_ODDS_MULTIPLIER);
+  const desiredMakerOddsScaled = new BigNumber(desiredTakerOdds).times(IMPLIED_ODDS_MULTIPLIER);
   const desiredLadderedOddsBN = roundDownOddsToNearestStep(desiredMakerOddsScaled);
   const desiredLadderedOddsStr = desiredLadderedOddsBN.toFixed(0);
 
-  logToFile(`Desired takerOdds (readable): ${desiredTakerOdds.toFixed(6)}, Scaled: ${desiredLadderedOddsStr}`);
+  logToFile(`Desired TakerOdds => ${desiredTakerOdds.toFixed(6)}, scaled => ${desiredLadderedOddsStr}`);
 
   let needsRepost = false;
   for (const order of activeOrders) {
-      if (order.percentageOdds !== desiredLadderedOddsStr) {
-          needsRepost = true;
-          logToFile(`⚠️ Order ${order.orderHash} has mismatched odds. Expected: ${desiredLadderedOddsStr}, Found: ${order.percentageOdds}`);
-          break;
-      }
+    if (order.percentageOdds !== desiredLadderedOddsStr) {
+      needsRepost = true;
+      logToFile(`⚠️ Mismatch => order ${order.orderHash} has ${order.percentageOdds}, expected ${desiredLadderedOddsStr}`);
+      break;
+    }
   }
 
   if (needsRepost) {
-      const hashesToCancel = activeOrders.map(o => o.orderHash);
-      await cancelOrdersForMonitoring(hashesToCancel);
+    const hashesToCancel = activeOrders.map(o => o.orderHash);
+    await cancelOrdersForMonitoring(hashesToCancel);
 
-      const sizeToPost = Math.min(remainingNeeded, increments);
-      if (sizeToPost < 10) {
-          logToFile(`🚨 Not reposting. Remaining size (${sizeToPost.toFixed(4)}) is below 10 units.`);
-          monitoringConfig.delete(marketHash);
-          return;
-      }
-
-      await postOrderForPosition(marketHash, outcome, sizeToPost, edge, minOrderSize);
-  } else {
-      logToFile(`✅ Active orders are still competitive for ${marketHash}. No need to repost.`);
-  }
-}
-
-/**
- * Fetch the total trades for the user on this market since we started monitoring.
- *
- * We'll sum up 'stake' from the trades to see how much has been filled.
- *
- * @param {string} marketHash
- * @param {number} startTimestamp - when we began monitoring (in milliseconds)
- * @returns {BigNumber} - total filled volume
- */
-async function getFilledVolumeSinceStart(marketHash, startTimestamp) {
-    try {
-      logToFile(`Attempting to fetch trades with startTimestamp: ${startTimestamp}`);
-  
-      // ===== Added Validation =====
-      if (!startTimestamp || isNaN(startTimestamp)) {
-        throw new Error(`Invalid startTimestamp: ${startTimestamp}`);
-      }
-  
-      const startDate = new Date(startTimestamp);
-      if (isNaN(startDate.getTime())) {
-        logToFile(`Invalid Date object created from startTimestamp: ${startTimestamp}`);
-        throw new Error(`Invalid Date object created from startTimestamp: ${startTimestamp}`);
-      } else {
-        logToFile(`Valid Date object: ${startDate.toISOString()}`);
-      }
-      // ===== End of Validation =====
-  
-      const startDateISO = startDate.toISOString();
-      const url = `${API_BASE_URL}/trades?marketHashes=${marketHash}&startDate=${startDateISO}&bettor=${MAKER_ADDRESS}&chainVersion=SXR`;
-      logToFile(`Fetching trades from URL: ${url}`);
-  
-      const response = await fetchWithTimeout(url, {}, 5000); // 5-second timeout
-      logToFile(`Fetched response status for trades: ${response.status}`);
-  
-      const data = await response.json();
-      logToFile(`Fetched trades data for ${marketHash}: ${JSON.stringify(data)}`);
-  
-      if (!data.data || !Array.isArray(data.data.trades)) {
-        logToFile(`Unexpected trades data format for ${marketHash}: ${JSON.stringify(data)}`);
-        return new BigNumber(0);
-      }
-  
-      let filledVolume = new BigNumber(0);
-      for (const trade of data.data.trades) {
-        const betSize = new BigNumber(trade.stake);
-        if (betSize.isNaN()) {
-          logToFile(`Invalid bet size in trade: ${JSON.stringify(trade)}`);
-          continue; // Skip invalid bet sizes
-        }
-        filledVolume = filledVolume.plus(betSize);
-      }
-  
-      logToFile(`Total filled volume for ${marketHash}: ${filledVolume.toString()}`);
-      return filledVolume;
-    } catch (err) {
-      logToFile(`Error fetching trades for ${marketHash}: ${err.message}`);
-      return new BigNumber(0);
+    const sizeToPost = Math.min(remainingNeeded, increments);
+    if (sizeToPost < 10) {
+      logToFile(`🚨 Not reposting => sizeToPost < 10 => done`);
+      monitoringConfig.delete(marketHash);
+      return;
     }
+
+    await postOrderForPosition(marketHash, outcome, sizeToPost, edge, minOrderSize);
+  } else {
+    logToFile(`✅ Active orders are still competitive => no need to repost.`);
+  }
 }
 
 // ===================== PROCESS MESSAGE HANDLERS =====================
 process.on("message", async (message) => {
   if (!message || !message.action) return;
-
   const { action, marketHash, config } = message;
-
   logToFile(`Received message: ${JSON.stringify(message)}`);
 
-   if (action === "start") {
-    // ===== Ensure startTime is properly set =====
+  if (action === "start") {
     if (!config.startTime || isNaN(config.startTime)) {
-      config.startTime = Date.now(); // Current time in milliseconds
-      logToFile(`startTime not provided or invalid. Setting startTime to current time: ${config.startTime}`);
-    } else {
-      // ===== Handle timestamps given in seconds instead of milliseconds =====
-      if (config.startTime < 1e12) { // Unix timestamp in milliseconds is >1e12
-        config.startTime = config.startTime * 1000; // Convert seconds to milliseconds
-        logToFile(`Detected startTime in seconds. Converted to milliseconds: ${config.startTime}`);
-      }
+      config.startTime = Date.now();
+      logToFile(`startTime not provided => using current time: ${config.startTime}`);
+    } else if (config.startTime < 1e12) {
+      config.startTime = config.startTime * 1000;
+      logToFile(`Detected startTime in seconds => converting to ms => ${config.startTime}`);
     }
-    // ===== End of Added Time Fix =====
-
-    // ✅ Store the new monitoring configuration
     monitoringConfig.set(marketHash, config);
-    logToFile(`✅ Started monitoring market: ${marketHash}`);
-
-    // 🔹 Ensure real-time updates are received
+    logToFile(`✅ Started monitoring ${marketHash}`);
     subscribeToOrderBook(marketHash);
-
-    logToFile(`📡 Subscribed to real-time order book for market: ${marketHash}`);
-    // You can initiate monitoring logic here if needed
+    logToFile(`📡 Subscribed to real-time order book for ${marketHash}`);
   } else if (action === "stop") {
     if (monitoringConfig.has(marketHash)) {
-      const pos = monitoringConfig.get(marketHash);
-      logToFile(`Stopping monitoring for market: ${marketHash} (${pos.marketDetails.teamOneName} vs. ${pos.marketDetails.teamTwoName} // ${pos.outcome === 1 ? pos.marketDetails.outcomeOneName : pos.marketDetails.outcomeTwoName})`);
-
-      // Fetch active orders for this market and maker
+      logToFile(`Stopping monitoring => ${marketHash}`);
       const activeOrders = await fetchActiveOrders(marketHash, MAKER_ADDRESS);
-      const orderHashes = activeOrders.map(order => order.orderHash);
-
-      if (orderHashes.length > 0) {
-        // Cancel the orders
-        await cancelOrdersForMonitoring(orderHashes);
-        logToFile(`Canceled orders for market ${marketHash}: ${orderHashes.join(", ")}`);
-      } else {
-        logToFile(`No active orders to cancel for market ${marketHash}`);
+      if (activeOrders.length > 0) {
+        await cancelOrdersForMonitoring(activeOrders.map(o => o.orderHash));
+        logToFile(`Canceled orders => ${activeOrders.map(o => o.orderHash)}`);
       }
-
-      // Remove the market from monitoringConfig
       monitoringConfig.delete(marketHash);
-      logToFile(`Stopped monitoring market: ${marketHash}`);
+      logToFile(`Stopped monitoring => ${marketHash}`);
     } else {
-      logToFile(`Attempted to stop monitoring non-existent market: ${marketHash}`);
+      logToFile(`Stop requested => non-existent ${marketHash}`);
     }
   } else if (action === "stopAll") {
     await stopAllMarkets();
   } else if (action === "update") {
     if (monitoringConfig.has(marketHash)) {
-      const pos = monitoringConfig.get(marketHash);
-      const updatedConfig = { ...pos, ...config };
-      monitoringConfig.set(marketHash, updatedConfig);
-      logToFile(`Updated monitoring configuration for market: ${marketHash}`);
-
-      // You can implement additional logic to handle configuration updates if needed
+      const oldCfg = monitoringConfig.get(marketHash);
+      const merged = { ...oldCfg, ...config };
+      monitoringConfig.set(marketHash, merged);
+      logToFile(`Updated config => ${marketHash}`);
     } else {
-      logToFile(`Attempted to update non-existent market: ${marketHash}`);
+      logToFile(`Attempted update => non-existent market => ${marketHash}`);
+    }
+  } else if (action === "forceRefreshAll") {
+    logToFile("Received 'forceRefreshAll' => checking all monitored markets...");
+    for (const [hash, cfg] of monitoringConfig.entries()) {
+      try {
+        await processMarket(hash, cfg);
+      } catch (err) {
+        logToFile(`Error in forceRefreshAll => ${hash}: ${err.message}`);
+      }
     }
   }
 });
 
 // ===================== GRACEFUL SHUTDOWN & CLEANUP =====================
-/**
- * Handles graceful shutdown on receiving termination signals.
- */
 async function gracefulShutdown(signal) {
-  logToFile(`Received ${signal}. Initiating graceful shutdown.`);
+  logToFile(`Received ${signal} => Initiating graceful shutdown.`);
   await stopAllMarkets();
 }
 
-// Handle termination signals for graceful shutdown
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 
-/**
- * Cancels all active orders across all monitored markets and clears the monitoring configuration.
- */
 async function stopAllMarkets() {
-  logToFile("Initiating graceful shutdown: Canceling all active orders.");
-  
+  logToFile("Canceling all active orders before shutdown...");
   const allOrderHashes = [];
-  
-  for (const [marketHash, config] of monitoringConfig.entries()) {
-    logToFile(`Fetching active orders for market: ${marketHash}`);
-    const activeOrders = await fetchActiveOrders(marketHash, MAKER_ADDRESS);
-    
+
+  for (const [mHash] of monitoringConfig.entries()) {
+    logToFile(`Fetching active orders => ${mHash}`);
+    const activeOrders = await fetchActiveOrders(mHash, MAKER_ADDRESS);
     if (activeOrders.length > 0) {
-      const orderHashes = activeOrders.map(order => order.orderHash);
-      allOrderHashes.push(...orderHashes);
-      logToFile(`Found ${orderHashes.length} active orders for market ${marketHash}: ${orderHashes.join(", ")}`);
-    } else {
-      logToFile(`No active orders found for market ${marketHash}.`);
+      allOrderHashes.push(...activeOrders.map(o => o.orderHash));
     }
   }
-  
+
   if (allOrderHashes.length > 0) {
-    logToFile(`Canceling all ${allOrderHashes.length} active orders.`);
+    logToFile(`Canceling ${allOrderHashes.length} total orders now...`);
     await cancelOrdersForMonitoring(allOrderHashes);
   } else {
-    logToFile("No active orders to cancel.");
+    logToFile("No active orders found to cancel.");
   }
-  
+
   monitoringConfig.clear();
-  logToFile("Cleared all monitoring configurations.");
-  
-  logToFile("Graceful shutdown completed. Exiting process.");
+  logToFile("Monitoring config cleared => Exiting process.");
   process.exit(0);
 }
 
